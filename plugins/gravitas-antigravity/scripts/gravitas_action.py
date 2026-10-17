@@ -134,7 +134,7 @@ _GIT_EXEC_CONFIG = ("external", "pager", "command", "fsmonitor", "editor", "help
 DESTRUCTIVE_GIT = frozenset({"reset", "clean", "checkout", "restore", "rm"})
 
 _SUBSTITUTION = re.compile(r"\$\(|`[^`]*`|[<>]\(")
-_REDIRECT = re.compile(r"(?:^|[\s\d])(?:>>?|<)(?=\s|$|=)")
+_REDIRECT = re.compile(r"(?<![-=<])(?:(?:>>?|&>>?)(?![(=>])(?:\s|$|&[\d-]|[^\s|&;()<>=])|<(?![<(=>])\s*[^\s|&;()<>=])")
 _PIPE = re.compile(r"\|")
 
 
@@ -161,6 +161,7 @@ _WRAPPERS = frozenset({"env", "sudo", "command", "nohup", "time", "nice", "stdbu
 def _strip_wrappers(argv: list, dangerous: list[str] | None = None) -> list:
     """Remove env assignments and wrapper commands so `env rm x` etc. dispatch on the real binary."""
     argv = list(argv)
+    wrapper_seen = False
     while argv:
         head = argv[0]
         if "=" in head and not head.startswith("-") and "/" not in head.split("=")[0]:
@@ -170,16 +171,11 @@ def _strip_wrappers(argv: list, dangerous: list[str] | None = None) -> list:
                     dangerous.append(name)
             argv = argv[1:]
             continue
-        if _basename(head) in _WRAPPERS:
+        w = _basename(head)
+        if w in _WRAPPERS:
+            wrapper_seen = True
             argv = argv[1:]
-            # env flags carry no command: -i, -u VAR, --unset=VAR
-            while argv and (argv[0] in ("-i", "--ignore-environment")
-                            or argv[0] in ("-u", "--unset")
-                            or argv[0].startswith("--unset=")):
-                if argv[0] in ("-u", "--unset") and len(argv) > 1:
-                    argv = argv[2:]
-                else:
-                    argv = argv[1:]
+            argv = _strip_wrapper_flags(w, argv)
             while argv and "=" in argv[0] and not argv[0].startswith("-"):
                 name = argv[0].split("=", 1)[0]
                 if name in DANGEROUS_ENV_VARS or name.upper() in DANGEROUS_ENV_VARS:
@@ -188,6 +184,10 @@ def _strip_wrappers(argv: list, dangerous: list[str] | None = None) -> list:
                 argv = argv[1:]
             continue
         break
+    if info is not None:
+        info["wrapper_seen"] = wrapper_seen
+        if wrapper_seen and argv and argv[0].startswith("-"):
+            info["unknown_wrapper_flag"] = argv[0]
     return argv
 
 
@@ -395,14 +395,19 @@ def _classify_shell_segment_binary(argv: list, segment: str, _depth: int = 0) ->
                 "reason": f"{binary} is never read-only"}
     if binary == "git":
         _i = 0
-        while _i < len(rest) and rest[_i].startswith("-"):
-            if rest[_i] == "-c" and _i + 1 < len(rest):
+        while _i < len(rest):
+            token = rest[_i]
+            if token == "-c" and _i + 1 < len(rest):
                 if any(k in rest[_i + 1].split("=", 1)[0].lower() for k in _GIT_EXEC_CONFIG):
                     return {"mutation": "mutation", "executable": "git", "argv": argv,
                             "reason": "git -c sets a config key that can run a program"}
                 _i += 2
-            else:
+            elif token in ("-C", "--git-dir", "--work-tree") and _i + 1 < len(rest):
+                _i += 2
+            elif token.startswith("-"):
                 _i += 1
+            else:
+                break
         rest, _git_dirs = _strip_git_globals(rest)
         sub = rest[0] if rest else ""
         if sub in DESTRUCTIVE_GIT:
@@ -525,6 +530,11 @@ def _classify_shell_segment_binary(argv: list, segment: str, _depth: int = 0) ->
         if verb in {"install", "publish", "add", "remove", "uninstall", "test", "run"}:
             return {"mutation": "mutation", "executable": binary, "argv": argv,
                     "reason": f"{binary} {verb} changes state or executes project code"}
+        if binary == "cargo" and verb in {"check", "c"}:
+            # cargo check compiles and runs build.rs and proc macros, so it is
+            # not read-only (it must agree with the "cargo check" CHECK_COMMANDS entry).
+            return {"mutation": "mutation", "executable": binary, "argv": argv,
+                    "reason": "cargo check executes build scripts and proc macros (side effects possible)"}
         if verb in {"", "ls", "list", "view", "show", "freeze", "check", "--version", "version"}:
             return {"mutation": "none", "executable": binary, "argv": argv,
                     "reason": f"{binary} {verb or 'query'} is read-only"}
@@ -584,8 +594,10 @@ def classify_shell(command: str, _depth: int = 0) -> dict:
     if _REDIRECT.search(text):
         worst = "mutation"
         reasons.append("redirection writes outside argv")
-        for match in re.finditer(r"(?:>|>>|<)\s*(\S+)", text):
-            paths.append(match.group(1))
+        for match in re.finditer(r"(?:>>?|&>>?|<)\s*([^\s;&|]+)", text):
+            target = match.group(1)
+            if not target.startswith("&") and target not in paths:
+                paths.append(target)
     for segment in segments:
         operand_paths = _operand_paths(segment)
         for operand in operand_paths:
